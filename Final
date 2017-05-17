@@ -1,0 +1,354 @@
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdarg.h>
+#include <string.h>
+#include "stdlib.h"
+#include "tm4c123gh6pm.h"
+#include "inc/hw_memmap.h"
+#include "inc/hw_types.h"
+#include "driverlib/sysctl.h"
+#include "driverlib/interrupt.h"
+#include "driverlib/gpio.h"
+#include "driverlib/timer.h"
+#include "inc/hw_i2c.h"
+#include "driverlib/debug.h"
+#include "driverlib/pwm.h"
+#include "driverlib/pin_map.h"
+#include "driverlib/rom.h"
+#include "driverlib/i2c.h"
+#include "inc/hw_uart.h"
+#include "inc/hw_gpio.h"
+#include "inc/hw_pwm.h"
+#include "driverlib/udma.h"
+#include "driverlib/uart.h"
+#include "driverlib/ssi.h"
+#include "driverlib/uart.h"
+#include "utils/uartstdio.h"
+//**************************************************************************************************************************
+// Definds and variables
+//**************************************************************************************************************************
+#define I2C_0_FIFOCTL 0x00000F04  // I2C FIFO Control
+
+#define PRESS_SLAVE_ADDR 0x28
+#define targetPressure
+uint32_t pressCount=0;
+float pressure_cm_H20=0;
+//setting base frequency
+#define PWM_FREQUENCY  55
+//volatile to ensure no elimination of variables
+volatile uint32_t ui32Load_Servo;
+volatile uint32_t ui32Load_Blower;
+volatile uint32_t ui32PWMClock;
+volatile uint8_t Servo_PWM_Adjust;
+volatile uint8_t Blower_PWM_Adjust;
+float desired_pressure = 4.0;
+
+//**************************************************************************************************************************
+// Function prototypes
+//**************************************************************************************************************************
+
+void UART_Write(float x);
+void Servo_PWM_Init(void);
+void Interrupt_Init(void);
+void OnboardLEDInit(void);
+void InitI2C0(void);
+void delayMS(int ms);
+void Blower_PWM_Init(void);
+void Timer0IntHandler(void);
+
+
+//**************************************************************************************************************************
+// Time based interrupt
+//**************************************************************************************************************************
+
+void Interrupt_Init(void)
+{
+
+    uint32_t ui32Period;
+           //SysCtlClockSet(SYSCTL_SYSDIV_5|SYSCTL_USE_PLL|SYSCTL_XTAL_16MHZ|SYSCTL_OSC_MAIN);
+           SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOF);
+           SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER0);
+           GPIOPinTypeGPIOOutput(GPIO_PORTF_BASE, GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3);
+           SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER0);
+           TimerConfigure(TIMER0_BASE, TIMER_CFG_PERIODIC);
+           ui32Period = (SysCtlClockGet() / 10) / 2;
+           TimerLoadSet(TIMER0_BASE, TIMER_A, ui32Period -1);
+           IntEnable(INT_TIMER0A);
+           TimerIntEnable(TIMER0_BASE, TIMER_TIMA_TIMEOUT);
+           IntMasterEnable();
+           TimerEnable(TIMER0_BASE, TIMER_A);
+
+}
+
+//**************************************************************************************************************************
+// on board LED functions
+//**************************************************************************************************************************
+
+void OnboardLEDInit(void)
+{
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOF);
+    GPIOPinTypeGPIOOutput(GPIO_PORTF_BASE, GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3);
+}
+
+//**************************************************************************************************************************
+// I2C modules
+//**************************************************************************************************************************
+//initialize I2C module 0
+//Slightly modified version of TI's example code
+void InitI2C0(void)
+{
+    //enable I2C module 0
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_I2C0);
+    //reset module
+    SysCtlPeripheralReset(SYSCTL_PERIPH_I2C0);
+    //enable GPIO peripheral that contains I2C 0
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
+    // Configure the pin muxing for I2C0 functions on port B2 and B3.
+    GPIOPinConfigure(GPIO_PB2_I2C0SCL);
+    GPIOPinConfigure(GPIO_PB3_I2C0SDA);
+    // Select the I2C function for these pins.
+    GPIOPinTypeI2CSCL(GPIO_PORTB_BASE, GPIO_PIN_2);
+    GPIOPinTypeI2C(GPIO_PORTB_BASE, GPIO_PIN_3);
+    // Enable and initialize the I2C0 master module.  Use the system clock for
+    // the I2C0 module.  The last parameter sets the I2C data transfer rate.
+    // If false the data rate is set to 100kbps and if true the data rate will
+    // be set to 400kbps.
+    I2CMasterInitExpClk(I2C0_BASE, SysCtlClockGet(), false);
+    //clear I2C FIFOs
+    //HWREG(I2C0_BASE + I2C_0_FIFOCTL)=80008000;
+}
+
+//read specified register on slave device
+uint32_t I2CReceive(uint32_t slave_addr)
+{
+    uint16_t Data1;
+    uint16_t Data2;
+    uint16_t Data3;
+
+    //wait for MCU to finish transaction
+    while(I2CMasterBusy(I2C0_BASE));
+    //specify that we are going to read from slave device
+    I2CMasterSlaveAddrSet(I2C0_BASE, slave_addr, true);
+    //send control byte and read from the register we
+    //specified
+    I2CMasterControl(I2C0_BASE, I2C_MASTER_CMD_BURST_RECEIVE_START);
+    //wait for MCU to finish transaction
+    while(I2CMasterBusy(I2C0_BASE));
+    Data1 = I2CMasterDataGet(I2C0_BASE);
+    if(Data1&0x00C0)
+    {
+        while(1){};
+    }
+    Data1 = Data1&0xFF3F;
+    //read last byte, and send stop command
+    I2CMasterControl(I2C0_BASE, I2C_MASTER_CMD_BURST_RECEIVE_FINISH);
+    //wait for MCU to finish transaction
+    while(I2CMasterBusy(I2C0_BASE));
+    Data2 = I2CMasterDataGet(I2C0_BASE);
+    Data1 = Data1<<8;
+    Data3 = Data1+Data2;
+    //return data pulled from the specified register
+    return Data3;
+}
+
+//**************************************************************************************************************************
+// Delay calculation
+//**************************************************************************************************************************
+void delayMS(int ms) {
+    SysCtlDelay( (SysCtlClockGet()/(3*1000))*ms ) ;
+}
+
+//**************************************************************************************************************************
+// Blower PWM function
+//**************************************************************************************************************************
+void Blower_PWM_Init(void){
+    // pin C5
+    //ROM_SysCtlClockSet(SYSCTL_SYSDIV_5|SYSCTL_USE_PLL|SYSCTL_OSC_MAIN|SYSCTL_XTAL_16MHZ);
+    ROM_SysCtlPWMClockSet(SYSCTL_PWMDIV_1);
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOC);
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_PWM0);
+    SysCtlPWMClockSet(SYSCTL_PWMDIV_1);
+    GPIOPinConfigure(GPIO_PC5_M0PWM7);
+    GPIOPinTypePWM(GPIO_PORTC_BASE, GPIO_PIN_5);
+    PWMGenConfigure(PWM0_BASE, PWM_GEN_3,PWM_GEN_MODE_DOWN | PWM_GEN_MODE_NO_SYNC);
+    PWMGenPeriodSet(PWM0_BASE, PWM_GEN_3, 320);
+    PWMPulseWidthSet(PWM0_BASE, PWM_OUT_7, 100);
+    PWMGenEnable(PWM0_BASE, PWM_GEN_3);
+    PWMOutputState(PWM0_BASE, PWM_OUT_7_BIT, true);
+}
+
+//**************************************************************************************************************************
+// Servo PWM
+//**************************************************************************************************************************
+void Servo_PWM_Init(void)
+{
+    //pin D0
+    //using sw 1 and 2
+    // to create a 1.5 ms pulse width
+    /*
+        PWM period x frequency = Servo_PWM_Adjust
+    */
+    Servo_PWM_Adjust = 83;
+    //has a direct relationship with how fast it moves
+    //divider has a range of 2-64. CPU runs as 40MHz. if divider set to 64, CPU runs at 625 KHz
+    //SysCtlClockSet(SYSCTL_SYSDIV_5|SYSCTL_USE_PLL|SYSCTL_OSC_MAIN|SYSCTL_XTAL_16MHZ);
+    SysCtlPWMClockSet(SYSCTL_PWMDIV_64);
+    //enabling PWM1 and outputting it on D0
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_PWM1);
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOD);
+    //PF0 and 4 are the launchpad buttons
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOF);
+    //PWM1 generator 0 outputing on D0
+    GPIOPinTypePWM(GPIO_PORTD_BASE, GPIO_PIN_0);
+    GPIOPinConfigure(GPIO_PD0_M1PWM0);
+    //PF0 and 4 are connected to switches S2 and S1
+    //read chapter 3 of workbook for more info
+    HWREG(GPIO_PORTF_BASE + GPIO_O_LOCK) = GPIO_LOCK_KEY;
+    HWREG(GPIO_PORTF_BASE + GPIO_O_CR) |= 0x01;
+    HWREG(GPIO_PORTF_BASE + GPIO_O_LOCK) = 0;
+    //configure pins F4 and F0 as inputs
+    GPIODirModeSet(GPIO_PORTF_BASE, GPIO_PIN_4|GPIO_PIN_0, GPIO_DIR_MODE_IN);
+    //configures the pull up resistors (the pins are pulled up) so when you click it acts
+    GPIOPadConfigSet(GPIO_PORTF_BASE, GPIO_PIN_4|GPIO_PIN_0, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU);
+    ui32PWMClock = SysCtlClockGet() / 64;
+    //the count to be loaded into the load register down counter
+    ui32Load_Servo = (ui32PWMClock / PWM_FREQUENCY) - 1;
+    PWMGenConfigure(PWM1_BASE, PWM_GEN_0, PWM_GEN_MODE_DOWN);
+    PWMGenPeriodSet(PWM1_BASE, PWM_GEN_0, ui32Load_Servo);
+    //it is divided by 1000 for the resolution of the servo
+    //sets the pulse width
+    /************** change these values (Servo_PWM_Adjust and ui32Load_Servo and 1000) to adjust the resolution of the servo ***************/
+    PWMPulseWidthSet(PWM1_BASE, PWM_OUT_0, Servo_PWM_Adjust * ui32Load_Servo / 1000);
+    PWMOutputState(PWM1_BASE, PWM_OUT_0_BIT, true);
+    PWMGenEnable(PWM1_BASE, PWM_GEN_0);
+}
+
+//**************************************************************************************************************************
+// Uart Initialization function
+//**************************************************************************************************************************
+void UART_Init(void)
+{
+    // Enable the GPIO Peripheral used by the UART.
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOA);
+    // Enable UART0
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_UART0);
+    // Configure GPIO Pins for UART mode.
+    //pin A0 A1
+    ROM_GPIOPinConfigure(GPIO_PA0_U0RX);
+    ROM_GPIOPinConfigure(GPIO_PA1_U0TX);
+    ROM_GPIOPinTypeUART(GPIO_PORTA_BASE, GPIO_PIN_0 | GPIO_PIN_1);
+    // Use the internal 16MHz oscillator as the UART clock source.
+    //
+    UARTClockSourceSet(UART0_BASE, UART_CLOCK_PIOSC);
+    UARTIntEnable(UART0_BASE, UART_INT_RX | UART_INT_RT);
+    //
+    // Initialize the UART for console I/O.
+    //
+    UARTStdioConfig(0, 115200, 16000000);
+    // Enable the peripherals used by this example.
+
+}
+//**************************************************************************************************************************
+//Uart float variable input calculator
+//**************************************************************************************************************************
+void UART_Write(float x)
+{
+
+    int_fast32_t i32IntegerPart;
+    int_fast32_t i32FractionPart;
+
+    i32IntegerPart = (int32_t) x;
+    i32FractionPart = (int32_t) (x * 1000.0f);
+    i32FractionPart = i32FractionPart - (i32IntegerPart * 1000);
+    if (i32FractionPart < 0)
+    {
+        i32FractionPart *= -1;
+    }
+    UARTprintf("Pressure is %3d.%03d\n", i32IntegerPart, i32FractionPart);
+    SysCtlDelay(300);
+}
+
+//**************************************************************************************************************************
+// Main function
+//**************************************************************************************************************************
+
+int main(void)
+{
+    SysCtlClockSet(SYSCTL_SYSDIV_5 | SYSCTL_USE_PLL | SYSCTL_OSC_MAIN| SYSCTL_XTAL_16MHZ);
+
+    ROM_IntPrioritySet(INT_TIMER0A, 0x40);  // nvic prioritization
+    ROM_IntPrioritySet(INT_UART0, 0x80);
+
+    Interrupt_Init();
+    OnboardLEDInit();
+    InitI2C0();
+    Blower_PWM_Init();
+    Servo_PWM_Init();
+    while (1)
+    {
+        //SysCtlDelay(SysCtlClockGet()/ 3/1000);
+
+        do
+        {
+
+            if (Servo_PWM_Adjust == 45)
+            {
+                //delay for the inhaled position
+                SysCtlDelay(2000000);
+                while (Servo_PWM_Adjust <= 125)
+                {
+                    Servo_PWM_Adjust++;
+                    SysCtlDelay(20000);
+                    PWMPulseWidthSet(PWM1_BASE, PWM_OUT_0,
+                                     Servo_PWM_Adjust * ui32Load_Servo / 1000);
+                }
+                //delay for exhaled position
+                SysCtlDelay(2000000);
+                break;
+            }
+            Servo_PWM_Adjust--;
+            SysCtlDelay(200000);
+            PWMPulseWidthSet(PWM1_BASE, PWM_OUT_0,
+                             Servo_PWM_Adjust * ui32Load_Servo / 1000);
+        }
+        while (Servo_PWM_Adjust >= 45);
+
+    }
+
+}
+void Timer0IntHandler(void)
+{
+    // IntMasterDisable();
+
+    // Clear the timer interrupt
+    TimerIntClear(TIMER0_BASE, TIMER_TIMA_TIMEOUT);
+    // Read the current state of the GPIO pin and
+    // write back the opposite state
+    if (pressure_cm_H20 <= desired_pressure)
+    {
+        //blue led
+        GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3,
+                     0x04);
+        PWMPulseWidthSet(PWM0_BASE, PWM_OUT_7, 320);
+    }
+    if (pressure_cm_H20 > desired_pressure)
+    {
+        //red led
+        GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3,
+                     0x02);
+        PWMPulseWidthSet(PWM0_BASE, PWM_OUT_7, 80);
+    }
+    pressCount = I2CReceive(PRESS_SLAVE_ADDR);
+    pressure_cm_H20 = (pressCount - 1638.00) / 13107.00 * 45 - 5.0;
+    //IntMasterEnable();
+
+    UART_Init();
+
+    UART_Write(pressure_cm_H20);
+    SysCtlDelay(SysCtlClockGet() / 3 / 100);
+
+}
+
+
+
+
